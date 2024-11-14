@@ -66,8 +66,15 @@ By default, $HOME/.rubies and /opt/rubies are searched."
               ;; add valid rubies root dirs to `rubies-root-dirs'
               (push (concat ruby-dir "/" version-dir) rubies-root-dirs))))))
 
+      ;;check if rubies-root-dirs is empty
+      (if (null rubies-root-dirs)
+          (progn
+            (message "[chruby-auto] error: no rubies found")
+            ;; return nil if failed
+            nil)
+
     ;; RET: (list) valid ruby root directories
-    rubies-root-dirs))
+    rubies-root-dirs)))
 
 (defun chruby-auto--find-ruby-version-file ()
   "Searches the directory tree for a file named .ruby-version file."
@@ -79,7 +86,11 @@ By default, $HOME/.rubies and /opt/rubies are searched."
 
     ;; RET: (string) full path to the closest .ruby-version file in the
     ;;      buffers directory tree
-    (when dir (concat dir ".ruby-version"))))
+    (if dir
+        (concat dir ".ruby-version")
+      ;; if .ruby-version not found, return nil
+      (message "[chruby-auto] error: `.ruby-version' file not found")
+      nil)))
 
 (defun chruby-auto--read-ruby-version-file (ruby-version-file)
   "Reads the .ruby-version file and returns its contents."
@@ -101,32 +112,40 @@ By default, $HOME/.rubies and /opt/rubies are searched."
       (let ((dir-version (car (last (split-string dir "/")))))
         (when (string= dir-version ruby-version)
           ;; RET: (string) the matching directory
-          (throw 'match dir))))))
-;; IF FAILED: returns nil
+          (throw 'match dir))))
+
+    ;; IF FAILED: returns nil
+    (message "[chruby-auto] error: could not find ruby %s installed"
+             ruby-version)
+    nil))
 
 (defun chruby-auto--gather-environment (auto-ruby)
   "Gathers Ruby environment variables to set in our Emacs environment."
+
   ;; ARG: (string) path to the directory containing the Ruby we are using
-
-  ;; assign local variables for the ruby interpreter and rub the gatherer script
-  (let* ((ruby-interp (concat auto-ruby "/bin/ruby"))
-         (cmd (format "%s %s" ruby-interp "chruby-auto-gatherer.rb"))
-         (output (string-trim (shell-command-to-string cmd)))
-         (elements (split-string output " " t)))
-
-    ;; collect the gatherer scripts' output and prep data for return
-    (when (= (length elements) 3)
-      (let* ((ruby-engine (nth 0 elements))
-             (ruby-version (nth 1 elements))
-             (gem-root (nth 2 elements))
-             (gem-home
-              (concat (expand-file-name "~")
-                      "/.gem/" ruby-engine "/" ruby-version))
-             (gem-path (concat gem-home ":" gem-root)))
-
-        ;; RET: (list) all chruby environment variables
-        ;;      (note that `auto-ruby' will become RUBY_ROOT)
-        (list auto-ruby ruby-engine ruby-version gem-home gem-root gem-path)))))
+  (let* ((ruby-interp (concat auto-ruby "/bin/ruby")))
+    (if (file-exists-p ruby-interp)
+        (let* ((cmd (format "%s -e \"ruby_engine = Object.const_defined?(:RUBY_ENGINE) ? RUBY_ENGINE : 'ruby'; \
+ruby_version = RUBY_VERSION; \
+gem_root = begin require 'rubygems'; Gem.default_dir rescue nil end; \
+puts [ruby_engine, ruby_version, gem_root].join(' ')\"" ruby-interp))
+               (output (string-trim (shell-command-to-string cmd)))
+               (elements (split-string output " " t)))
+          ;; collect the gatherer script output and prep data for return
+          (when (= (length elements) 3)
+            (let* ((ruby-engine (nth 0 elements))
+                   (ruby-version (nth 1 elements))
+                   (gem-root (nth 2 elements))
+                   (gem-home (concat (expand-file-name "~")
+                                     "/.gem/" ruby-engine "/" ruby-version))
+                   (gem-path (concat gem-home ":" gem-root)))
+              ;; RET: (list) all chruby environment variables
+              ;;      (note that `auto-ruby' will become RUBY_ROOT)
+              (list
+               auto-ruby ruby-engine ruby-version gem-home gem-root gem-path))))
+      ;; if ruby interpreter is not found, return nil and message error
+      (message "[chruby-auto] error: %s/bin/ruby not found" auto-ruby)
+      nil)))
 
 (defun chruby-auto--set-environment
     (ruby-root ruby-engine ruby-version gem-home gem-root gem-path)
@@ -157,22 +176,26 @@ By default, $HOME/.rubies and /opt/rubies are searched."
         (if (and (string-equal current-ruby-root ruby-root)
                  (string-equal current-gem-root gem-root)
                  (string-equal current-gem-home gem-home))
-            ;; if above versions match; do nothing (same ruby versions used
-            nil
+            ;; if above versions match; do nothing (same ruby versions used)
+            (message "[chruby-auto]: no change, using %s" ruby-root)
+          ;; return nil
+          nil
 
-          ;; if vars exists, but do not match
-          ;; unset PATH and then set all variables and path
-          (progn
-            (chruby-auto--unset-path
-             current-ruby-root current-gem-root current-gem-home)
-            (funcall set-vars)
-            (chruby-auto--set-path ruby-root gem-root gem-home)))
+            ;; if vars exists, but do not match
+            ;; unset PATH and then set all variables and path
+            (progn
+              (chruby-auto--unset-path
+               current-ruby-root current-gem-root current-gem-home)
+              (funcall set-vars)
+              (chruby-auto--set-path ruby-root gem-root gem-home)
+              (message "[chruby-auto]: using %s" ruby-root)))
 
       ;; if RUBY_ROOT is not set; we'll set all of our vars
       (progn
         (funcall set-vars)
         (chruby-auto--set-path
-         ruby-root gem-root gem-home)))))
+         ruby-root gem-root gem-home)
+        (message "[chruby-auto]: using %s" ruby-root)))))
 
 (defun chruby-auto--set-path (ruby-root gem-root gem-home)
   "Sets PATH environment variable for Chruby."
@@ -233,16 +256,15 @@ By default, $HOME/.rubies and /opt/rubies are searched."
           (chruby-auto--read-ruby-version-file
            (chruby-auto--find-ruby-version-file))))
 
-    ;; validate ruby version from .ruby-version is available
-    (let ((ruby-auto
-           (chruby-auto--validate-ruby-version rubies-dirs ruby-wanted)))
-
-      (when ruby-auto
-
-        (let ((env-vars (chruby-auto--gather-environment ruby-auto)))
-
-          (when (= (length env-vars) 6)
-            (apply #'chruby-auto--set-environment env-vars)))))))
+    ;; if both rubies-dirs and ruby-wanted are non-nil, proceed to validate
+    (when (and rubies-dirs ruby-wanted)
+      ;; validate ruby version from .ruby-version is available
+      (let ((ruby-auto
+             (chruby-auto--validate-ruby-version rubies-dirs ruby-wanted)))
+        (when ruby-auto
+          (let ((env-vars (chruby-auto--gather-environment ruby-auto)))
+            (when (= (length env-vars) 6)
+              (apply #'chruby-auto--set-environment env-vars))))))))
 
 (provide 'chruby-auto)
 ;;; chruby-auto.el ends here
